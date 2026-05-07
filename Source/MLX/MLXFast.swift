@@ -434,6 +434,8 @@ public enum MLXFast {
     public static func fromFp8(
         _ x: MLXArray, dtype: DType = .bfloat16, stream: StreamOrDevice = .default
     ) -> MLXArray {
+        precondition(x.dtype == .uint8, "FP8 input must be uint8 bit patterns")
+        precondition(dtype == .bfloat16 || dtype == .float16 || dtype == .float32, "Target dtype must be a floating point type")
         var result = mlx_array_new()
         mlx_from_fp8(&result, x.ctx, dtype.cmlxDtype, stream.ctx)
         return MLXArray(result)

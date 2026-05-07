@@ -35,11 +35,12 @@ jobs:
           git checkout -B sync/upstream-latest origin/main
           git checkout upstream/main -- .
           git checkout origin/main -- .github/workflows
+          git commit -m "chore: sync with upstream/main" || true
           git push -f origin sync/upstream-latest
 
       - name: Create Pull Request to Main
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SWIFTLM_PR_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           gh pr create --base main --head sync/upstream-latest \
             --title "🔄 Auto-Sync: Apple Upstream Repository" \
