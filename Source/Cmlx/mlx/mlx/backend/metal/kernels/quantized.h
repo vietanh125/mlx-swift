@@ -188,6 +188,68 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   return sum;
 }
 
+// Wide-load 4-bit qdot: reads the thread's 8-byte weight block as one uint2
+// vector load (instead of four uint16 loads), unpacks to uint16 lanes in
+// registers, and keeps the exact pre-scaled-x AND+fma scheme of the scalar
+// qdot (masked uint16 values stay < 2^24, so the float conversion is exact;
+// a uint32-mask variant would not be). Pointer must be 8-byte aligned —
+// qmv_fast guarantees it (simd_lid * 8 bytes within rows whose stride is a
+// multiple of 256 bytes when K % 512 == 0).
+// Vectorized companion to `load_vector` for the 4-bit pre-scale pattern:
+// one vec<T,4> load per 4 values (the /1,/16,/256,/4096 pre-scale repeats
+// every 4 lanes, so it maps exactly onto the vector lanes).
+template <typename T, typename U, int values_per_thread>
+inline U load_vector_q4_wide(const device T* x, thread U* x_thread) {
+  static_assert(
+      values_per_thread % 4 == 0, "load_vector_q4_wide requires multiples of 4");
+  U sum = 0;
+  const device vec<T, 4>* xv = (const device vec<T, 4>*)x;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    vec<T, 4> v = xv[i];
+    U a = v[0];
+    U b = v[1];
+    U c = v[2];
+    U d = v[3];
+    sum += a + b + c + d;
+    x_thread[4 * i + 0] = a;
+    x_thread[4 * i + 1] = b / 16.0f;
+    x_thread[4 * i + 2] = c / 256.0f;
+    x_thread[4 * i + 3] = d / 4096.0f;
+  }
+  return sum;
+}
+
+template <typename U, int values_per_thread>
+inline U qdot_u4_wide(
+    const device uint8_t* w,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  static_assert(
+      values_per_thread % 16 == 0,
+      "qdot_u4_wide processes 16 values (one uint2) per iteration");
+
+  U accum = 0;
+  const device uint2* wv = (const device uint2*)w;
+  for (int i = 0; i < (values_per_thread / 16); i++) {
+    uint2 v = wv[i];
+    const thread U* xt = x_thread + 16 * i;
+    for (int j = 0; j < 2; j++) {
+      uint32_t u = v[j];
+      uint16_t lo = u & 0xffff;
+      uint16_t hi = u >> 16;
+      accum +=
+          (xt[8 * j + 0] * (lo & 0x000f) + xt[8 * j + 1] * (lo & 0x00f0) +
+           xt[8 * j + 2] * (lo & 0x0f00) + xt[8 * j + 3] * (lo & 0xf000));
+      accum +=
+          (xt[8 * j + 4] * (hi & 0x000f) + xt[8 * j + 5] * (hi & 0x00f0) +
+           xt[8 * j + 6] * (hi & 0x0f00) + xt[8 * j + 7] * (hi & 0xf000));
+    }
+  }
+  return scale * accum + sum * bias;
+}
+
 // qdot over a thread-local (register-resident) packed weight block. Used by
 // the multi-row qmv kernels, which copy each weight block into registers once
 // and dot it against several input vectors. Only the bit widths routed to
@@ -823,7 +885,12 @@ METAL_FUNC void qmv_fast_impl(
   y += tid.x * out_vec_size + out_row;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
-    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+    U sum;
+    if constexpr (bits == 4) {
+      sum = load_vector_q4_wide<T, U, values_per_thread>(x, x_thread);
+    } else {
+      sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+    }
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
@@ -832,7 +899,13 @@ METAL_FUNC void qmv_fast_impl(
 
       U s = sl[0];
       U b = bl[0];
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      if constexpr (bits == 4) {
+        result[row] +=
+            qdot_u4_wide<U, values_per_thread>(wl, x_thread, s, b, sum);
+      } else {
+        result[row] +=
+            qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      }
     }
 
     ws += block_size * bytes_per_pack / pack_factor;
