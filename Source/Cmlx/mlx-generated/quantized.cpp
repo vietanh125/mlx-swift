@@ -1017,7 +1017,12 @@ METAL_FUNC void qmv_fast_nb_impl(
     for (int b = 0; b < NB; b++) {
       // Clamp out-of-range rows to row 0 (their results are never written).
       const device T* xb = x + (b < nb_valid ? b : 0) * in_vec_size;
-      sums[b] = load_vector<T, U, values_per_thread, bits>(xb, x_thread[b]);
+      if constexpr (bits == 4) {
+        sums[b] =
+            load_vector_q4_wide<T, U, values_per_thread>(xb, x_thread[b]);
+      } else {
+        sums[b] = load_vector<T, U, values_per_thread, bits>(xb, x_thread[b]);
+      }
 
       for (int row = 0; row < results_per_simdgroup; row++) {
         result[b][row] += qdot_local<U, values_per_thread, bits>(
@@ -2766,6 +2771,7 @@ template <typename T, const int group_size, const int bits>
 }
 
 } // namespace mlx::core::metal
+
 
 
 
