@@ -296,6 +296,67 @@ void qmv(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// Multi-row qmv: one dispatch computes all M (2..4) output rows, reading the
+// weights once instead of M times (see qmv_fast_nb_impl in quantized.h).
+// Caller guarantees: mode == affine, no broadcast batch, x row-contiguous,
+// N % 8 == 0, K % 512 == 0.
+void qmv_fast_nb(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  // 2 rows per slice: ceil(M / 2) concurrent slices keep occupancy high and
+  // let the SLC dedupe the second slice's weight reads.
+  constexpr int nb = 2;
+  int bn = 8;
+  int bk = 32;
+  MTL::Size group_dims(bk, 2, 1);
+  MTL::Size grid_dims((M + nb - 1) / nb, (N + bn - 1) / bn, 1);
+
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
+
+  concatenate(
+      kname,
+      mode + "_qmv_fast_nb_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_nb_",
+      nb);
+  auto kernel = get_quantized_kernel_wrapped(
+      d, kname, "qmv_fast_nb", mode, type_string, group_size, bits, nb);
+
+  auto& compute_encoder = d.get_command_encoder(s.index);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  if (biases) {
+    compute_encoder.set_input_array(*biases, c++);
+  }
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void qvm_split_k(
     const array& x,
     const array& w,
@@ -1284,6 +1345,25 @@ void dispatch_qmv(
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
   if ((K == 128 || K == 64) && is_power_of_2(bits)) {
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
+  // Small multi-row decode batch (e.g. speculative-decoding verify): one
+  // dispatch computes all M rows, reading the weights once. Restricted to
+  // the plain affine matmul case the nb kernel supports.
+  // Opt-in experiment (MLX_QMV_NB=1): single-weight-read multi-row kernel.
+  // On M1 Pro it benchmarks at parity-to-slightly-worse than the per-row
+  // grid slices below (the M=1 kernel is instruction-issue-limited at ~60%
+  // of DRAM bandwidth, so extra parallel slices are cheaper than extra
+  // per-thread work). Kept opt-in for bandwidth-starved devices (iPad),
+  // where the re-read traffic of the default path may dominate instead.
+  static const bool enable_nb = std::getenv("MLX_QMV_NB") != nullptr;
+  if (enable_nb && mode == "affine" && biases && M >= 2 && M <= 4 &&
+      (bits == 4 || bits == 8) &&
+      out.size() == static_cast<size_t>(M) * N && w.ndim() == 2 &&
+      x.flags().row_contiguous && N % 8 == 0 && K % 512 == 0) {
+    qmv_fast_nb(
+        x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
 

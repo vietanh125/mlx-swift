@@ -188,6 +188,42 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   return sum;
 }
 
+// qdot over a thread-local (register-resident) packed weight block. Used by
+// the multi-row qmv kernels, which copy each weight block into registers once
+// and dot it against several input vectors. Only the bit widths routed to
+// those kernels are implemented.
+template <typename U, int values_per_thread, int bits>
+inline U qdot_local(
+    const thread uint8_t* w,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  static_assert(
+      bits == 4 || bits == 8, "qdot_local implemented for bits in {4, 8}");
+
+  U accum = 0;
+
+  if (bits == 4) {
+    const thread uint16_t* ws = (const thread uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum +=
+          (x_thread[4 * i] * (ws[i] & 0x000f) +
+           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    }
+  }
+
+  else if (bits == 8) {
+    for (int i = 0; i < values_per_thread; i++) {
+      accum += x_thread[i] * w[i];
+    }
+  }
+
+  return scale * accum + sum * bias;
+}
+
 template <typename U, int values_per_thread, int bits>
 inline U qdot(
     const device uint8_t* w,
@@ -809,6 +845,113 @@ METAL_FUNC void qmv_fast_impl(
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
       y[row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
+// Multi-row variant of qmv_fast for small decode batches (speculative-
+// decoding verify steps, M in [2, 4]). Each grid-x slice computes NB (= 2)
+// matmul rows: per K-block the packed weight block is copied into registers
+// once (4 rows x 2 uint32) and dotted against both input vectors via
+// qdot_local. ceil(M / NB) slices run concurrently; the second slice's
+// weight reads hit the SLC right behind the first's, so DRAM traffic stays
+// ~1x while per-thread ALU only doubles and parallelism stays high.
+// (Measured alternatives on M1 Pro: per-row grid slices (plain qmv) are
+// bandwidth-bound; a single slice with NB=4 is ALU-bound; NB=4 with 2-D
+// x_thread registers spills. NB=2 x 2 slices is the sweet spot.)
+//
+// Assumes x rows are contiguous with stride in_vec_size and no extra
+// broadcast batch dims (the host routes only that case here).
+template <typename T, int group_size, int bits, int NB>
+METAL_FUNC void qmv_fast_nb_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& n_rows,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+
+  constexpr int u32_per_row = packs_per_thread * bytes_per_pack / 4;
+  thread U x_thread[NB][values_per_thread];
+  thread U sums[NB];
+  thread uint32_t wl[results_per_simdgroup][u32_per_row];
+  thread U result[NB][results_per_simdgroup];
+  for (int b = 0; b < NB; b++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[b][row] = 0;
+    }
+  }
+
+  // This slice's batch rows: [b_base, b_base + nb_valid).
+  const int b_base = tid.x * NB;
+  const int nb_valid = min(NB, n_rows - b_base);
+
+  // Adjust positions
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += b_base * in_vec_size + simd_lid * values_per_thread;
+  y += b_base * out_vec_size + out_row;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    U s[results_per_simdgroup];
+    U bv[results_per_simdgroup];
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      s[row] = scales[row * in_vec_size_g];
+      bv[row] = biases[row * in_vec_size_g];
+      const device uint32_t* wrow =
+          (const device uint32_t*)(ws + row * in_vec_size_w);
+      for (int p = 0; p < u32_per_row; p++) {
+        wl[row][p] = wrow[p];
+      }
+    }
+
+    for (int b = 0; b < NB; b++) {
+      // Clamp out-of-range rows to row 0 (their results are never written).
+      const device T* xb = x + (b < nb_valid ? b : 0) * in_vec_size;
+      sums[b] = load_vector<T, U, values_per_thread, bits>(xb, x_thread[b]);
+
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        result[b][row] += qdot_local<U, values_per_thread, bits>(
+            (const thread uint8_t*)wl[row], x_thread[b], s[row], bv[row],
+            sums[b]);
+      }
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int b = 0; b < NB; b++) {
+      U r = simd_sum(result[b][row]);
+      if (simd_lid == 0 && b < nb_valid) {
+        y[b * out_vec_size + row] = static_cast<T>(r);
+      }
     }
   }
 }
@@ -1538,6 +1681,33 @@ template <typename T, int group_size, int bits, bool batched>
       y,
       in_vec_size,
       out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, int group_size, int bits, int NB>
+[[kernel]] void affine_qmv_fast_nb(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& n_rows [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  qmv_fast_nb_impl<T, group_size, bits, NB>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      n_rows,
       tid,
       simd_gid,
       simd_lid);
